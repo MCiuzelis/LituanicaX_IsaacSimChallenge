@@ -1,0 +1,1033 @@
+"""MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
+
+Observation space (23 scalars — no camera):
+    [0]  average wheel surface speed ∈ [0, 1],   normalized by max_velocity_m_s.
+    [1]  forward car velocity ∈ [0, 1],           normalized by max_velocity_m_s.
+    [2]  lateral car velocity ∈ [-1, 1],          normalized by max_velocity_m_s.
+    [3]  yaw rate ∈ [-1, 1],                      normalized by 10 rad/s.
+    [4]  distance to track centerline ∈ [0, 1],   normalized by track_max_dist_m.
+    [5]  relative heading to centerline ∈ [-1, 1], signed angle / π.
+    [6]  distance to next corner ∈ [0, 1],        normalized by corner_lookahead_max_m.
+    [7]  curvature of next corner ∈ [0, 1],       normalized by max_curvature.
+    [8-22] 5 Lookahead Horizon Points (ordered closest to furthest: +10, +20, +40, +70, +100 point indices):
+           Each lookahead point introduces 3 scalars:
+             - local body x (forward) ∈ [-1, 1],  normalized by corner_lookahead_max_m
+             - local body y (lateral) ∈ [-1, 1],  normalized by corner_lookahead_max_m
+             - curvature at point     ∈ [0, 1],   normalized by max_curvature
+
+Action space (2):
+    [0]  throttle command in [-1, 1] — forward-only (the car never reverses)
+    [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import os
+from collections.abc import Sequence
+
+import isaaclab.sim as sim_utils
+import torch
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_from_euler_xyz
+
+# ---------------------------------------------------------------------------
+# Asset USD paths  (relative to this file → project root → assets/)
+# ---------------------------------------------------------------------------
+_ASSETS_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "../../../assets")
+)
+
+MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
+TRACK_USD = os.path.join(_ASSETS_DIR, "Track.usdc")
+_TRACKPOINTS_CSV = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "../../../../Training/TrackPoints.csv")
+)
+WALL_USD = os.path.join(_ASSETS_DIR, "Walls.usdc")
+
+# ---------------------------------------------------------------------------
+# Physical constants — MuSHR nano v2 (fixed by the USD / hardware)
+# ---------------------------------------------------------------------------
+WHEEL_RADIUS = 0.037  # m  (82 mm diameter wheels)
+TRACK_SCALE = 0.85
+
+
+# ===========================================================================
+# Environment Configuration
+# ===========================================================================
+
+
+@configclass
+class ConeTrackEnvCfg(DirectRLEnvCfg):
+    """Single source of truth for every number you might want to change."""
+
+    # ── Core env parameters ────────────────────────────────────────────────
+    decimation: int = 8  # policy at ~60 Hz  (sim 480 Hz / 8)
+    episode_length_s: float = 90.0  # 180 s × 60 Hz = 10 800 steps
+    action_space: int = 2
+    observation_space: int = (
+        23  # Expanded from 8 to 23 to capture lookahead spatial points
+    )
+    state_space: int = 0
+
+    sim: SimulationCfg = SimulationCfg(dt=1.0 / 480.0, render_interval=8)
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=26,
+        env_spacing=0.0,
+        replicate_physics=True,
+    )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TRACK OBSERVATION — normalization and corner-detection parameters
+    # ════════════════════════════════════════════════════════════════════════
+    track_max_dist_m: float = 2.0  # normaliser for distance to centerline
+    corner_curvature_threshold: float = (
+        0.5  # min curvature (1/m) to count as a corner peak
+    )
+    corner_lookahead_max_m: float = (
+        5.0  # normaliser for distance-to-next-corner and lookahead coords
+    )
+    max_curvature: float = 10.0  # normaliser for curvature (1/m)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SPAWN — initial robot position, heading, and speed
+    # ════════════════════════════════════════════════════════════════════════
+    spawn_grace_steps: int = 10
+
+    preset_spawn_points: list = [
+        (0.756, 5.0, 20.8),
+        (3.91, 3.31, -156.0),
+        (3.62, 1.97, -154.48),
+        (-5.46, 3.7, 0.0),
+        (-3.6, 4.7, -217.86),
+    ]
+    spawn_x_scale: float = -1.15 * TRACK_SCALE
+    spawn_y_scale: float = -1.15 * TRACK_SCALE
+
+    duplicate_with_flipped_yaw: bool = True
+    spawn_yaw_jitter_rad: float = 0.1
+
+    # ════════════════════════════════════════════════════════════════════════
+    # DYNAMICS — effort-controlled DC-motor drivetrain (AWD), tuned to real car
+    # ════════════════════════════════════════════════════════════════════════
+    car_mass_kg: float = 1.27
+    max_velocity_m_s: float = 6.7
+    drive_torque: float = 0.068
+    brake_torque_base: float = 0.028
+    brake_torque_gain: float = 0.310
+    brake_throttle_scale: float = 0.4
+    brake_release_omega: float = 2.0
+    ground_static_friction: float = 2.0
+    ground_dynamic_friction: float = 1.6
+    suspension_stiffness: float = 1e6
+    max_steer_rad: float = 0.488
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TERMINATION THRESHOLDS
+    # ════════════════════════════════════════════════════════════════════════
+    wall_collision_radius_m: float = 0.15
+    slow_stop_speed_fraction: float = 0.03
+
+    # ════════════════════════════════════════════════════════════════════════
+    # REWARD WEIGHTS
+    # ════════════════════════════════════════════════════════════════════════
+    alive_weight: float = 0.015
+    distance_weight: float = 4.0
+    average_speed_weight: float = 0.0
+    steer_deadzone_weight: float = 0.003
+    steer_deadzone: float = 0.05
+    steer_rate_weight: float = 0.005
+    throttle_rate_weight: float = 0.007
+    slip_weight: float = 2.0
+    proximity_speed_weight: float = 0.0
+    proximity_lookahead_m: float = 2.0
+    braking_v2_weight: float = 0.0
+
+    lap_reward_weight: float = 8.0
+    lap_return_radius_m: float = 0.3
+    lap_min_time_s: float = 20.0
+    lap_max_time_s: float = 50.0
+
+    # ════════════════════════════════════════════════════════════════════════
+    # HARDWARE CONFIG  (robot articulation)
+    # ════════════════════════════════════════════════════════════════════════
+    robot_cfg: ArticulationCfg = ArticulationCfg(
+        prim_path="/World/envs/env_.*/Robot",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=MUSHR_USD,
+            scale=(0.755, 0.755, 0.755),
+            activate_contact_sensors=False,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                max_linear_velocity=10000.0,
+                max_angular_velocity=100000.0,
+                max_depenetration_velocity=1.0,
+                max_contact_impulse=5.0,
+                enable_gyroscopic_forces=True,
+            ),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=False,
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                sleep_threshold=0.005,
+                stabilization_threshold=0.001,
+            ),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0, 0, 0),
+            joint_pos={
+                "back_left_wheel_throttle": 0.0,
+                "back_right_wheel_throttle": 0.0,
+                "front_left_wheel_throttle": 0.0,
+                "front_right_wheel_throttle": 0.0,
+                "front_left_wheel_steer": 0.0,
+                "front_right_wheel_steer": 0.0,
+                "front_left_wheel_suspension": 0.0,
+                "front_right_wheel_suspension": 0.0,
+                "back_left_wheel_suspension": 0.0,
+                "back_right_wheel_suspension": 0.0,
+            },
+        ),
+        actuators={
+            "steering": ImplicitActuatorCfg(
+                joint_names_expr=["front_left_wheel_steer", "front_right_wheel_steer"],
+                stiffness=100.0,
+                damping=10.0,
+                velocity_limit_sim=6.51,
+                effort_limit_sim=3.2,
+            ),
+        },
+    )
+
+    def __post_init__(self):
+        self.robot_cfg.actuators["throttle"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*_wheel_throttle"],
+            stiffness=0.0,
+            damping=0.0,
+            friction=0.0,
+            effort_limit_sim=5.0,
+            velocity_limit_sim=1e9,
+        )
+        self.robot_cfg.actuators["suspension"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*_wheel_suspension"],
+            stiffness=self.suspension_stiffness,
+            damping=0.0,
+            friction=0.0,
+            effort_limit_sim=1e9,
+            velocity_limit_sim=1e9,
+        )
+
+
+# ===========================================================================
+# Environment Class
+# ===========================================================================
+
+
+class ConeTrackEnv(DirectRLEnv):
+    cfg: ConeTrackEnvCfg
+
+    def __init__(self, cfg: ConeTrackEnvCfg, render_mode: str | None = None, **kwargs):
+        super().__init__(cfg, render_mode, **kwargs)
+
+        # Joint indices
+        self._rear_throttle_ids, _ = self.robot.find_joints(
+            ["back_left_wheel_throttle", "back_right_wheel_throttle"]
+        )
+        self._front_throttle_ids, _ = self.robot.find_joints(
+            ["front_left_wheel_throttle", "front_right_wheel_throttle"]
+        )
+        self._steer_ids, _ = self.robot.find_joints(
+            ["front_left_wheel_steer", "front_right_wheel_steer"]
+        )
+
+        self._steer_tan = torch.zeros(self.num_envs, device=self.device)
+        self._all_throttle_ids = torch.tensor(
+            self._rear_throttle_ids + self._front_throttle_ids,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        self._wheel_torque = torch.zeros(self.num_envs, 4, device=self.device)
+
+        # Correct the total mass
+        _pv = self.robot.root_physx_view
+        _masses = _pv.get_masses()
+        _native_total = _masses[0].sum().item()
+        _mass_scale = cfg.car_mass_kg / _native_total
+        _env_ids_cpu = torch.arange(self.num_envs, dtype=torch.int, device="cpu")
+        _pv.set_masses(_masses * _mass_scale, _env_ids_cpu)
+        _pv.set_inertias(_pv.get_inertias() * _mass_scale, _env_ids_cpu)
+
+        self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
+
+        self._steer_cmd_curr = torch.zeros(self.num_envs, device=self.device)
+        self._steer_cmd_prev = torch.zeros(self.num_envs, device=self.device)
+        self._throttle_cmd_curr = torch.zeros(self.num_envs, device=self.device)
+        self._throttle_cmd_prev = torch.zeros(self.num_envs, device=self.device)
+
+        self._omega_noload_full = cfg.max_velocity_m_s / WHEEL_RADIUS
+
+        self._lap_state = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._lap_start_step = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._fastest_lap_s_global = torch.tensor(0.0, device=self.device)
+        self._spawn_heading_cos = torch.ones(self.num_envs, device=self.device)
+        self._spawn_heading_sin = torch.zeros(self.num_envs, device=self.device)
+        self._lap_prev_forward = torch.zeros(self.num_envs, device=self.device)
+        self._wall_ever_touched = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+        self._cumulative_forward_vel = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
+
+        _wall_segs = self._extract_wall_segments_xy()
+        if _wall_segs:
+            import numpy as _np
+
+            _seg_arr = torch.from_numpy(_np.asarray(_wall_segs, dtype=_np.float32)).to(
+                self.device
+            )
+            self._wall_seg_a = _seg_arr[:, 0, :].contiguous()
+            self._wall_seg_b = _seg_arr[:, 1, :].contiguous()
+        else:
+            self._wall_seg_a = None
+            self._wall_seg_b = None
+
+        self._centerline_data = self._load_centerline()
+
+    def _setup_scene(self):
+        self.robot = Articulation(self.cfg.robot_cfg)
+
+        track_cfg = sim_utils.UsdFileCfg(
+            usd_path=TRACK_USD, scale=(TRACK_SCALE, TRACK_SCALE, TRACK_SCALE)
+        )
+        track_cfg.func(
+            "/World/Track",
+            track_cfg,
+            translation=(0, 0.0, 0.0),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+        )
+
+        wall_cfg = sim_utils.UsdFileCfg(
+            usd_path=WALL_USD, scale=(TRACK_SCALE, TRACK_SCALE, TRACK_SCALE)
+        )
+        wall_cfg.func(
+            "/World/Walls",
+            wall_cfg,
+            translation=(0, 0.0, 0.0),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+        )
+
+        import omni.usd
+        from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
+
+        stage = omni.usd.get_context().get_stage()
+
+        wheel_link_names = {
+            "front_left_wheel_link",
+            "front_right_wheel_link",
+            "back_left_wheel_link",
+            "back_right_wheel_link",
+        }
+        wheel_root = stage.GetPrimAtPath("/World/envs/env_0/Robot/mushr_nano")
+        if wheel_root.IsValid():
+            for prim in Usd.PrimRange(wheel_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                if prim.GetParent().GetName() not in wheel_link_names:
+                    continue
+                mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                mesh_collision.GetApproximationAttr().Set("convexHull")
+
+        for wall_path, collision_enabled in (("/World/Walls", True),):
+            wall_root = stage.GetPrimAtPath(wall_path)
+            if not wall_root.IsValid():
+                continue
+            for prim in Usd.PrimRange(wall_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                wall_collision = UsdPhysics.CollisionAPI.Apply(prim)
+                wall_collision.GetCollisionEnabledAttr().Set(collision_enabled)
+                wall_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                wall_mesh_collision.GetApproximationAttr().Set("none")
+            wall_rb = UsdPhysics.RigidBodyAPI.Apply(wall_root)
+            wall_rb.GetRigidBodyEnabledAttr().Set(True)
+            wall_rb.GetKinematicEnabledAttr().Set(True)
+            UsdGeom.Imageable(wall_root).MakeInvisible()
+
+        suspension_joint_names = (
+            "front_left_wheel_suspension",
+            "front_right_wheel_suspension",
+            "back_left_wheel_suspension",
+            "back_right_wheel_suspension",
+        )
+        for env_id in range(self.num_envs):
+            base_link_path = f"/World/envs/env_{env_id}/Robot/mushr_nano/base_link"
+            for joint_name in suspension_joint_names:
+                joint_prim = stage.GetPrimAtPath(f"{base_link_path}/{joint_name}")
+                if not joint_prim.IsValid():
+                    continue
+                for prop in list(joint_prim.GetProperties()):
+                    prop_name = prop.GetName()
+                    if "stiffness" in prop_name or "damping" in prop_name:
+                        attr = joint_prim.GetAttribute(prop_name)
+                        if attr.IsValid():
+                            attr.Block()
+
+        ground_cfg = sim_utils.GroundPlaneCfg(
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=self.cfg.ground_static_friction,
+                dynamic_friction=self.cfg.ground_dynamic_friction,
+                restitution=0.05,
+                friction_combine_mode="multiply",
+                restitution_combine_mode="min",
+            )
+        )
+        ground_cfg.func("/World/GroundPlane", ground_cfg)
+
+        rubber_mat_path = "/World/PhysicsMaterials/WheelRubber"
+        rubber_mat_prim = stage.DefinePrim(rubber_mat_path, "Material")
+        UsdPhysics.MaterialAPI.Apply(rubber_mat_prim)
+        phys_rubber = UsdPhysics.MaterialAPI(rubber_mat_prim)
+        phys_rubber.CreateStaticFrictionAttr().Set(1.0)
+        phys_rubber.CreateDynamicFrictionAttr().Set(1.0)
+        phys_rubber.CreateRestitutionAttr().Set(0.05)
+
+        self.scene.clone_environments(copy_from_source=False)
+
+        rubber_mat = UsdShade.Material(rubber_mat_prim)
+        for env_id in range(self.num_envs):
+            wheel_root_env = stage.GetPrimAtPath(
+                f"/World/envs/env_{env_id}/Robot/mushr_nano"
+            )
+            if not wheel_root_env.IsValid():
+                continue
+            for prim in Usd.PrimRange(wheel_root_env):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                if prim.GetParent().GetName() not in wheel_link_names:
+                    continue
+                UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                    rubber_mat, UsdShade.Tokens.strongerThanDescendants, "physics"
+                )
+
+        self.scene.articulations["robot"] = self.robot
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+    def _extract_wall_segments_xy(self):
+        try:
+            import omni.usd
+            from pxr import Gf, Usd, UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            wall_root = stage.GetPrimAtPath("/World/Walls")
+            if not wall_root.IsValid():
+                return []
+
+            xf_cache = UsdGeom.XformCache()
+            segments: list = []
+
+            for prim in Usd.PrimRange(wall_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                mesh = UsdGeom.Mesh(prim)
+                points_attr = mesh.GetPointsAttr().Get()
+                if points_attr is None:
+                    continue
+                counts_attr = mesh.GetFaceVertexCountsAttr().Get()
+                indices_attr = mesh.GetFaceVertexIndicesAttr().Get()
+                if counts_attr is None or indices_attr is None:
+                    continue
+
+                world_xf = xf_cache.GetLocalToWorldTransform(prim)
+                world_pts = [
+                    world_xf.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+                    for p in points_attr
+                ]
+
+                idx_ptr = 0
+                for fc in counts_attr:
+                    face = [int(indices_attr[idx_ptr + i]) for i in range(fc)]
+                    idx_ptr += fc
+                    for k in range(1, fc - 1):
+                        tri = (face[0], face[k], face[k + 1])
+                        pts3 = (world_pts[tri[0]], world_pts[tri[1]], world_pts[tri[2]])
+                        for e in range(3):
+                            a3 = pts3[e]
+                            b3 = pts3[(e + 1) % 3]
+                            if abs(a3[2] - b3[2]) > 0.05:
+                                continue
+                            dx = b3[0] - a3[0]
+                            dy = b3[1] - a3[1]
+                            if dx * dx + dy * dy < 1e-4:
+                                continue
+                            segments.append(
+                                [
+                                    [float(a3[0]), float(a3[1])],
+                                    [float(b3[0]), float(b3[1])],
+                                ]
+                            )
+            return segments
+        except Exception as e:
+            print(f"[ConeTrackEnv] Wall segment extraction failed: {e}")
+            return []
+
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        raw = actions[:, :2].clamp(-1.0, 1.0)
+        u = raw[:, 0].unsqueeze(-1)
+        wheel_omega = self.robot.data.joint_vel[:, self._all_throttle_ids].clamp(
+            min=0.0
+        )
+
+        omega_noload = u.clamp(min=1e-3) * self.cfg.max_velocity_m_s / WHEEL_RADIUS
+        drive_rolloff = (1.0 - wheel_omega / omega_noload).clamp(0.0, 1.0)
+        drive_torque = self.cfg.drive_torque * drive_rolloff
+
+        brake_level = (-u).clamp(min=0.0) * self.cfg.brake_throttle_scale
+        brake_fade = (wheel_omega / self.cfg.brake_release_omega).clamp(0.0, 1.0)
+        brake_torque = (
+            -(self.cfg.brake_torque_base + self.cfg.brake_torque_gain * brake_level)
+            * brake_fade
+        )
+
+        self._wheel_torque = torch.where(
+            u > 0.0,
+            drive_torque,
+            torch.where(u < 0.0, brake_torque, torch.zeros_like(brake_torque)),
+        )
+
+        self._filtered_steer = raw[:, 1]
+        steer_ang = self._filtered_steer * self.cfg.max_steer_rad
+        self._steer_tan = torch.tan(steer_ang)
+
+        self._steer_cmd_prev = self._steer_cmd_curr
+        self._steer_cmd_curr = raw[:, 1]
+        self._throttle_cmd_prev = self._throttle_cmd_curr
+        self._throttle_cmd_curr = raw[:, 0]
+
+    def _apply_action(self) -> None:
+        if self._wall_seg_a is not None:
+            pos_xy = self.robot.data.root_pos_w[:, :2].unsqueeze(1)
+            a = self._wall_seg_a.unsqueeze(0)
+            b = self._wall_seg_b.unsqueeze(0)
+            ab = b - a
+            ap = pos_xy - a
+            t = (ap * ab).sum(dim=-1) / (ab * ab).sum(dim=-1).clamp(min=1e-8)
+            t = t.clamp(0.0, 1.0)
+            closest = a + t.unsqueeze(-1) * ab
+            dist_sq = (pos_xy - closest).pow(2).sum(dim=-1)
+            wall_hit_now = (
+                dist_sq.min(dim=1).values.sqrt() < self.cfg.wall_collision_radius_m
+            )
+        else:
+            wall_hit_now = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+        in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
+        self._wall_ever_touched |= wall_hit_now & ~in_grace
+
+        wall_mask = self._wall_ever_touched
+        wheel_torque = self._wheel_torque.clone()
+        wheel_torque[wall_mask] = 0.0
+        self.robot.set_joint_effort_target(
+            wheel_torque, joint_ids=self._all_throttle_ids
+        )
+
+        steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2).clone()
+        steer_positions[wall_mask] = 0.0
+        self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
+
+    def _load_centerline(self) -> dict:
+        if not os.path.isfile(_TRACKPOINTS_CSV):
+            return None
+        try:
+            pts = []
+            with open(_TRACKPOINTS_CSV, newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    x_blender = float(row[0])
+                    y_blender = float(row[1])
+                    x_isaac = x_blender * self.cfg.spawn_x_scale
+                    y_isaac = y_blender * self.cfg.spawn_y_scale
+                    pts.append([x_isaac, y_isaac])
+            if not pts:
+                return None
+            centerline = torch.tensor(pts, dtype=torch.float32, device=self.device)
+            M = centerline.shape[0]
+
+            prev = torch.cat([centerline[-1:], centerline[:-1]], dim=0)
+            nxt = torch.cat([centerline[1:], centerline[:1]], dim=0)
+
+            v1 = centerline - prev
+            v2 = nxt - centerline
+            v3 = nxt - prev
+
+            n1 = torch.norm(v1, dim=1)
+            n2 = torch.norm(v2, dim=1)
+            n3 = torch.norm(v3, dim=1)
+
+            cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+            curvature = 2.0 * cross.abs() / (n1 * n2 * n3).clamp(min=1e-8)
+
+            tangents = v3 / n3.unsqueeze(-1).clamp(min=1e-8)
+
+            arc_length = torch.zeros(M, device=self.device)
+            arc_length[1:] = torch.cumsum(n1[1:], dim=0)
+            track_length = arc_length[-1] + n1[0]
+
+            left = torch.cat([curvature[-1:], curvature[:-1]], dim=0)
+            right = torch.cat([curvature[1:], curvature[:1]], dim=0)
+            is_local_max = (curvature > left) & (curvature >= right)
+            is_corner = is_local_max & (curvature > self.cfg.corner_curvature_threshold)
+            corner_idx = torch.where(is_corner)[0]
+
+            print(
+                f"[ConeTrackEnv] Centerline: {M} points, "
+                f"track length {track_length:.2f} m, "
+                f"{len(corner_idx)} corners detected"
+            )
+            return {
+                "centerline": centerline,
+                "tangents": tangents,
+                "curvature": curvature,
+                "arc_length": arc_length,
+                "track_length": track_length,
+                "corner_idx": corner_idx,
+                "num_points": M,
+            }
+        except Exception as e:
+            print(f"[ConeTrackEnv] Failed to load centerline: {e}")
+            return None
+
+    def _get_observations(self) -> dict:
+        cfg = self.cfg
+        N = self.num_envs
+
+        # 1) Wheel velocity
+        wheel_omega_mean = (
+            self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
+        )
+        wheel_vel_norm = (wheel_omega_mean * WHEEL_RADIUS / cfg.max_velocity_m_s).clamp(
+            0.0, 1.0
+        )
+
+        # 2) Forward car velocity
+        car_vel_fwd = self.robot.data.root_lin_vel_b[:, 0]
+        car_vel_fwd_norm = (car_vel_fwd / cfg.max_velocity_m_s).clamp(0.0, 1.0)
+
+        # 3) Lateral car velocity
+        lateral_vel = self.robot.data.root_lin_vel_b[:, 1]
+        lateral_vel_norm = (lateral_vel / cfg.max_velocity_m_s).clamp(-1.0, 1.0)
+
+        # 4) Yaw rate
+        yaw_rate = self.robot.data.root_ang_vel_b[:, 2]
+        yaw_rate_norm = (yaw_rate / 10.0).clamp(-1.0, 1.0)
+
+        pos_xy = self.robot.data.root_pos_w[:, :2]
+
+        # 5-22) Track-geometry observations
+        if self._centerline_data is not None:
+            cl = self._centerline_data["centerline"]
+            tangents = self._centerline_data["tangents"]
+            curvature = self._centerline_data["curvature"]
+            arc_len = self._centerline_data["arc_length"]
+            track_len = self._centerline_data["track_length"]
+            corner_idx = self._centerline_data["corner_idx"]
+            M = self._centerline_data["num_points"]
+
+            # Nearest point on centerline
+            diff = pos_xy.unsqueeze(1) - cl.unsqueeze(0)
+            sq_dist = (diff * diff).sum(dim=-1)
+            nearest_d = sq_dist.min(dim=1)
+            nearest_idx = nearest_d.indices
+
+            # 5) Distance to centerline (Crosstrack Error)
+            dist_cl = nearest_d.values.sqrt()
+            dist_cl_norm = (dist_cl / cfg.track_max_dist_m).clamp(0.0, 1.0)
+
+            # 6) Relative heading
+            q = self.robot.data.root_quat_w
+            w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+            car_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+            car_fwd = torch.stack([torch.cos(car_yaw), torch.sin(car_yaw)], dim=-1)
+
+            tgt = tangents[nearest_idx]
+            dot = (car_fwd * tgt).sum(dim=-1).clamp(-1.0, 1.0)
+            heading_err = torch.acos(dot.abs())
+
+            cross_val = car_fwd[:, 0] * tgt[:, 1] - car_fwd[:, 1] * tgt[:, 0]
+            rel_heading = heading_err * torch.sign(cross_val)
+            rel_heading_norm = (rel_heading / math.pi).clamp(-1.0, 1.0)
+
+            # 7-8) Next corner metrics
+            arc_at_nearest = arc_len[nearest_idx]
+            arc_corners = arc_len[corner_idx]
+            arc_n = arc_at_nearest.unsqueeze(-1)
+            arc_c = arc_corners.unsqueeze(0)
+
+            fwd_dist = torch.where(
+                arc_c >= arc_n, arc_c - arc_n, track_len - arc_n + arc_c
+            )
+            best_dist, best_k = fwd_dist.min(dim=1)
+
+            no_corner = best_dist >= track_len
+            dist_corner = torch.where(
+                no_corner, torch.full_like(best_dist, track_len), best_dist
+            )
+            corner_curv = torch.where(
+                no_corner, torch.zeros_like(best_dist), curvature[corner_idx][best_k]
+            )
+
+            dist_corner_norm = (dist_corner / cfg.corner_lookahead_max_m).clamp(
+                0.0, 1.0
+            )
+            corner_curv_norm = (corner_curv / cfg.max_curvature).clamp(0.0, 1.0)
+
+            # ── NEW: Spatial Lookahead Trajectory Horizon (8 to 22) ──
+            # Sample point positions at fixed forward index offsets (since point density is uniform ~0.05m)
+            # offsets correspond roughly to 0.5m, 1.0m, 2.0m, 3.5m, and 5.0m lookahead distance vectors.
+            cos_yaw = torch.cos(car_yaw)
+            sin_yaw = torch.sin(car_yaw)
+            lookahead_offsets = [10, 20, 40, 70, 100]
+            lookahead_features = []
+
+            for offset in lookahead_offsets:
+                lh_idx = (nearest_idx + offset) % M
+                lh_pos = cl[lh_idx]  # [N, 2] world position of lookahead point
+
+                # Compute distance vector from vehicle to lookahead point
+                dx = lh_pos[:, 0] - pos_xy[:, 0]
+                dy = lh_pos[:, 1] - pos_xy[:, 1]
+
+                # Transform world coordinates to vehicle-local body frame (X=Forward, Y=Lateral Left)
+                local_x = dx * cos_yaw + dy * sin_yaw
+                local_y = -dx * sin_yaw + dy * cos_yaw
+
+                # Normalize to standard [-1, 1] range using lookahead scalar capacity bounds
+                local_x_norm = (local_x / cfg.corner_lookahead_max_m).clamp(-1.0, 1.0)
+                local_y_norm = (local_y / cfg.corner_lookahead_max_m).clamp(-1.0, 1.0)
+
+                # Extract and normalize the local track curvature profile at this lookup point
+                lh_curv = curvature[lh_idx]
+                lh_curv_norm = (lh_curv / cfg.max_curvature).clamp(0.0, 1.0)
+
+                lookahead_features.extend([local_x_norm, local_y_norm, lh_curv_norm])
+        else:
+            dist_cl_norm = torch.zeros(N, device=self.device)
+            rel_heading_norm = torch.zeros(N, device=self.device)
+            dist_corner_norm = torch.zeros(N, device=self.device)
+            corner_curv_norm = torch.zeros(N, device=self.device)
+            lookahead_features = [torch.zeros(N, device=self.device) for _ in range(15)]
+
+        obs_list = [
+            wheel_vel_norm,
+            car_vel_fwd_norm,
+            lateral_vel_norm,
+            yaw_rate_norm,
+            dist_cl_norm,
+            rel_heading_norm,
+            dist_corner_norm,
+            corner_curv_norm,
+        ] + lookahead_features
+
+        obs = torch.stack(obs_list, dim=-1)
+        return {"policy": obs}
+
+    def _get_rewards(self) -> torch.Tensor:
+        lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
+        dt = self.cfg.decimation * self.cfg.sim.dt
+
+        r_distance = (
+            self.cfg.distance_weight * lin_vel_b / self.cfg.max_velocity_m_s * dt
+        )
+
+        forward_speed = lin_vel_b.clamp(min=0.0)
+        self._cumulative_forward_vel += forward_speed
+        speed_sample_count = self.episode_length_buf.float().clamp(min=1.0)
+        avg_speed_norm = (
+            self._cumulative_forward_vel
+            / speed_sample_count
+            / self.cfg.max_velocity_m_s
+        ).clamp(0.0, 1.0)
+        r_average_speed = self.cfg.average_speed_weight * avg_speed_norm
+
+        pos_xy = self.robot.data.root_pos_w[:, :2]
+
+        steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0)
+        steer_excess = (steer_norm - self.cfg.steer_deadzone).clamp(min=0.0)
+        steer_excess_norm = steer_excess / max(1.0 - self.cfg.steer_deadzone, 1e-6)
+        r_steer_shape = -self.cfg.steer_deadzone_weight * steer_excess_norm
+
+        steer_rate = (self._steer_cmd_curr - self._steer_cmd_prev).abs()
+        r_steer_rate = -self.cfg.steer_rate_weight * steer_rate
+
+        throttle_rate = (self._throttle_cmd_curr - self._throttle_cmd_prev).abs()
+        r_throttle_rate = -self.cfg.throttle_rate_weight * throttle_rate
+
+        wheel_omega_mean = (
+            self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
+        )
+        wheel_vel = wheel_omega_mean * WHEEL_RADIUS
+        slip_ratio = (wheel_vel - forward_speed).abs() / self.cfg.max_velocity_m_s
+        r_slip = -self.cfg.slip_weight * slip_ratio.clamp(0.0, 1.0)
+
+        r_alive = torch.full(
+            (self.num_envs,), self.cfg.alive_weight, device=self.device
+        )
+
+        if self.cfg.proximity_speed_weight > 0.0 and self._wall_seg_a is not None:
+            vel_w = self.robot.data.root_lin_vel_w[:, :2]
+            speed_w = torch.linalg.vector_norm(vel_w, dim=-1)
+            moving = speed_w > 0.5
+            dir_w = vel_w / speed_w.clamp(min=1e-3).unsqueeze(-1)
+
+            a = self._wall_seg_a.unsqueeze(0)
+            b = self._wall_seg_b.unsqueeze(0)
+            s = b - a
+            r = dir_w.unsqueeze(1)
+            ap = a - pos_xy.unsqueeze(1)
+
+            cross_rs = r[..., 0] * s[..., 1] - r[..., 1] * s[..., 0]
+            cross_ap_s = ap[..., 0] * s[..., 1] - ap[..., 1] * s[..., 0]
+            cross_ap_r = ap[..., 0] * r[..., 1] - ap[..., 1] * r[..., 0]
+
+            denom = torch.where(
+                cross_rs.abs() > 1e-8, cross_rs, torch.full_like(cross_rs, 1e-8)
+            )
+            t_hit = cross_ap_s / denom
+            u_hit = cross_ap_r / denom
+
+            hit = (
+                (cross_rs.abs() > 1e-8)
+                & (t_hit > 0.0)
+                & (u_hit >= 0.0)
+                & (u_hit <= 1.0)
+            )
+            t_masked = torch.where(hit, t_hit, torch.full_like(t_hit, float("inf")))
+            nearest_dist = t_masked.min(dim=1).values
+
+            closeness = 1.0 - (nearest_dist / self.cfg.proximity_lookahead_m).clamp(
+                0.0, 1.0
+            )
+            speed_norm = (speed_w / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
+            r_proximity_speed = (
+                -self.cfg.proximity_speed_weight
+                * closeness
+                * speed_norm
+                * moving.float()
+            )
+        else:
+            r_proximity_speed = torch.zeros(self.num_envs, device=self.device)
+
+        pos_rel = pos_xy - self._spawn_pos
+        forward_now = (
+            pos_rel[:, 0] * self._spawn_heading_cos
+            + pos_rel[:, 1] * self._spawn_heading_sin
+        )
+        spawn_dist_for_lap = torch.linalg.vector_norm(pos_rel, dim=-1)
+        in_grace_lap = self.episode_length_buf < self.cfg.spawn_grace_steps
+
+        crossed_start_line = (self._lap_prev_forward * forward_now) < 0.0
+        in_return_radius = spawn_dist_for_lap < self.cfg.lap_return_radius_m
+
+        leaving = (self._lap_state == 0) & (~in_return_radius) & (~in_grace_lap)
+        self._lap_state = torch.where(
+            leaving, torch.ones_like(self._lap_state), self._lap_state
+        )
+
+        completing = (self._lap_state == 1) & crossed_start_line & in_return_radius
+        self._lap_state = torch.where(
+            completing, torch.zeros_like(self._lap_state), self._lap_state
+        )
+
+        self._lap_prev_forward = forward_now.detach()
+
+        lap_steps_elapsed = (
+            (self.episode_length_buf - self._lap_start_step).float().clamp(min=1.0)
+        )
+        lap_time_s = lap_steps_elapsed * dt
+        lap_time_clamped = lap_time_s.clamp(
+            self.cfg.lap_min_time_s, self.cfg.lap_max_time_s
+        )
+        r_lap = torch.where(
+            completing,
+            self.cfg.lap_reward_weight * self.cfg.lap_max_time_s / lap_time_clamped,
+            torch.zeros_like(lap_time_s),
+        )
+
+        self._lap_start_step = torch.where(
+            completing, self.episode_length_buf.clone(), self._lap_start_step
+        )
+
+        empty = torch.tensor([], device=self.device)
+        if completing.any():
+            lap_times_done = lap_time_s[completing].detach()
+            new_min = lap_times_done.min()
+            self._fastest_lap_s_global = torch.where(
+                self._fastest_lap_s_global > 0,
+                torch.minimum(self._fastest_lap_s_global, new_min),
+                new_min,
+            )
+            fastest_log = self._fastest_lap_s_global.detach().unsqueeze(0).clone()
+        else:
+            lap_times_done = empty
+            fastest_log = empty
+
+        laps_per_min = completing.float().sum().unsqueeze(0) * (60.0 / dt)
+
+        self.extras["log"] = {
+            "Lap/lap_time_s": lap_times_done,
+            "Lap/fastest_lap_s": fastest_log,
+            "Lap/laps_per_min": laps_per_min,
+        }
+
+        if self.cfg.braking_v2_weight > 0.0:
+            throttle_cmd_v2 = self._throttle_cmd_curr
+            brake_input_v2 = (-throttle_cmd_v2).clamp(0.0, 1.0)
+            speed_fwd_v2 = lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s
+            r_braking_v2 = (
+                self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * brake_input_v2
+            )
+        else:
+            r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
+
+        total = (
+            r_alive
+            + r_distance
+            + r_average_speed
+            + r_steer_shape
+            + r_steer_rate
+            + r_throttle_rate
+            + r_slip
+            + r_proximity_speed
+            + r_braking_v2
+            + r_lap
+        )
+        return total
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._wall_seg_a is not None:
+            pos_xy = self.robot.data.root_pos_w[:, :2].unsqueeze(1)
+            a = self._wall_seg_a.unsqueeze(0)
+            b = self._wall_seg_b.unsqueeze(0)
+            ab = b - a
+            ap = pos_xy - a
+            t = (ap * ab).sum(dim=-1) / (ab * ab).sum(dim=-1).clamp(min=1e-8)
+            t = t.clamp(0.0, 1.0)
+            closest = a + t.unsqueeze(-1) * ab
+            dist_sq = (pos_xy - closest).pow(2).sum(dim=-1)
+            wall_hit = (
+                dist_sq.min(dim=1).values.sqrt() < self.cfg.wall_collision_radius_m
+            )
+        else:
+            wall_hit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
+        self._wall_ever_touched |= wall_hit & ~in_grace
+        wall_terminated = self._wall_ever_touched
+
+        q = self.robot.data.root_quat_w
+        up_z = 1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])
+        flipped = (up_z < 0.3) & ~in_grace
+
+        lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
+        stopped = (
+            lin_vel_b < (self.cfg.slow_stop_speed_fraction * self.cfg.max_velocity_m_s)
+        ) & (self.episode_length_buf > 45)
+
+        terminated = wall_terminated | flipped | stopped
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        return terminated, time_out
+
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        if env_ids is None:
+            env_ids = self.robot._ALL_INDICES
+
+        super()._reset_idx(env_ids)
+
+        n = len(env_ids)
+        default_root_state = self.robot.data.default_root_state[env_ids].clone()
+        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+
+        speed_vec = torch.zeros(n, device=self.device)
+        sz = 0.002
+        env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+
+        pts = list(self.cfg.preset_spawn_points)
+        if self.cfg.duplicate_with_flipped_yaw:
+            pts = pts + [(x, y, theta + 180.0) for x, y, theta in pts]
+        idx = torch.randint(0, len(pts), (n,), device="cpu").tolist()
+        xs = torch.tensor(
+            [pts[i][0] * self.cfg.spawn_x_scale for i in idx],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        ys = torch.tensor(
+            [pts[i][1] * self.cfg.spawn_y_scale for i in idx],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        base_yaw = torch.tensor(
+            [math.radians(pts[i][2]) for i in idx],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        yaw = base_yaw.clone()
+        if self.cfg.spawn_yaw_jitter_rad > 0.0:
+            yaw = (
+                yaw
+                + (torch.rand(n, device=self.device) - 0.5)
+                * 2.0
+                * self.cfg.spawn_yaw_jitter_rad
+            )
+        spawn_xy = torch.stack([xs, ys], dim=-1)
+
+        default_root_state[:, 0] = spawn_xy[:, 0]
+        default_root_state[:, 1] = spawn_xy[:, 1]
+        default_root_state[:, 2] = sz
+
+        zeros = torch.zeros(n, device=self.device)
+        dq = quat_from_euler_xyz(zeros, zeros, yaw)
+        default_root_state[:, 3:7] = dq
+
+        default_root_state[:, 7:] = 0.0
+        default_root_state[:, 7] = speed_vec * torch.cos(yaw)
+        default_root_state[:, 8] = speed_vec * torch.sin(yaw)
+
+        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+
+        self._filtered_steer[env_ids] = 0.0
+        self._steer_cmd_curr[env_ids] = 0.0
+        self._steer_cmd_prev[env_ids] = 0.0
+        self._throttle_cmd_curr[env_ids] = 0.0
+        self._throttle_cmd_prev[env_ids] = 0.0
+
+        self._wall_ever_touched[env_ids] = False
+        self._cumulative_forward_vel[env_ids] = 0.0
+        self._spawn_pos[env_ids_t] = spawn_xy
+        self._lap_state[env_ids_t] = 0
+        self._lap_start_step[env_ids_t] = 0
+        self._spawn_heading_cos[env_ids_t] = torch.cos(base_yaw)
+        self._spawn_heading_sin[env_ids_t] = torch.sin(base_yaw)
+        self._lap_prev_forward[env_ids_t] = 0.0
+
+        joint_pos = self.robot.data.default_joint_pos[env_ids]
+        joint_vel = torch.zeros_like(joint_pos)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
