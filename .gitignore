@@ -1,3 +1,6 @@
+# Agent config directories
+.codex
+
 # Training logs and checkpoints — excluded from git (can be multi-GB)
 logs/
 outputs/
