@@ -78,7 +78,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.checkpoint:
         ckpt = args_cli.checkpoint
         if not os.path.isabs(ckpt) and not os.path.isfile(ckpt):
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            project_root = os.path.dirname(os.path.abspath(__file__))
             candidate = os.path.join(project_root, ckpt)
             if os.path.isfile(candidate):
                 ckpt = candidate

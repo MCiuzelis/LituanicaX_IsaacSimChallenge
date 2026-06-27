@@ -6,7 +6,7 @@ The agent observes a 23-dimensional state (speed, yaw rate, centerline error, he
 
 ## Structure
 
-- `Training/train.py` / `Training/play.py` — entry points for training and deployment
-- `Training/source/tasks/cone_track/` — environment (`env.py`) and PPO config (`agents/ppo_cfg.py`)
-- `Training/assets/` — USD assets: car, track mesh, walls
-- `Training/TrackPoints.csv` — centerline waypoints
+- `train.py` / `play.py` — entry points for training and deployment
+- `source/tasks/cone_track/` — environment (`env.py`) and PPO config (`agents/ppo_cfg.py`)
+- `assets/` — USD assets: car, track mesh, walls
+- `TrackPoints.csv` — centerline waypoints

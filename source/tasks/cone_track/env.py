@@ -27,7 +27,7 @@ _ASSETS_DIR = os.path.normpath(
 MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
 TRACK_USD = os.path.join(_ASSETS_DIR, "Track.usdc")
 _TRACKPOINTS_CSV = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "../../../../Training/TrackPoints.csv")
+    os.path.join(os.path.dirname(__file__), "../../../../TrackPoints.csv")
 )
 WALL_USD = os.path.join(_ASSETS_DIR, "Walls.usdc")
 

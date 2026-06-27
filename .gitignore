@@ -4,7 +4,7 @@
 # Training logs and checkpoints — excluded from git (can be multi-GB)
 logs/
 outputs/
-Training/.venv/
+.venv/
 Deployment/.venv/
 Deployment/Ros2/log/
 Deployment/Ros2/logs/
@@ -27,7 +27,7 @@ dist/
 build/
 
 # Asset archives
-Training/assets/archives/
+assets/archives/
 
 # Editor / OS noise
 *.vscode/
