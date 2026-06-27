@@ -1,24 +1,6 @@
-"""MuSHR nano v2 RC car — cone-track navigation environment (DirectRLEnv).
-
-Observation space (23 scalars — no camera):
-    [0]  average wheel surface speed ∈ [0, 1],   normalized by max_velocity_m_s.
-    [1]  forward car velocity ∈ [0, 1],           normalized by max_velocity_m_s.
-    [2]  lateral car velocity ∈ [-1, 1],          normalized by max_velocity_m_s.
-    [3]  yaw rate ∈ [-1, 1],                      normalized by 10 rad/s.
-    [4]  distance to track centerline ∈ [0, 1],   normalized by track_max_dist_m.
-    [5]  relative heading to centerline ∈ [-1, 1], signed angle / π.
-    [6]  distance to next corner ∈ [0, 1],        normalized by corner_lookahead_max_m.
-    [7]  curvature of next corner ∈ [0, 1],       normalized by max_curvature.
-    [8-22] 5 Lookahead Horizon Points (ordered closest to furthest: +10, +20, +40, +70, +100 point indices):
-           Each lookahead point introduces 3 scalars:
-             - local body x (forward) ∈ [-1, 1],  normalized by corner_lookahead_max_m
-             - local body y (lateral) ∈ [-1, 1],  normalized by corner_lookahead_max_m
-             - curvature at point     ∈ [0, 1],   normalized by max_curvature
-
-Action space (2):
-    [0]  throttle command in [-1, 1] — forward-only (the car never reverses)
-    [1]  steering command in [-1, 1]  → scaled to [-max_steer_rad, +max_steer_rad]
-"""
+"""MuSHR nano v2 — cone-track navigation.  Obs: 23 (speed, yaw, centerline error,
+heading err, corner dist/curvature, 5 lookahead points with body-frame x/y/curvature).
+Action: 2 (throttle ∈ [-1,1], steering ∈ [-1,1] → ±max_steer_rad)."""
 
 from __future__ import annotations
 
@@ -37,9 +19,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz
 
-# ---------------------------------------------------------------------------
-# Asset USD paths  (relative to this file → project root → assets/)
-# ---------------------------------------------------------------------------
+# ── Assets ─────────────────────────────────────────────────────────────────
 _ASSETS_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "../../../assets")
 )
@@ -58,9 +38,67 @@ WHEEL_RADIUS = 0.037  # m  (82 mm diameter wheels)
 TRACK_SCALE = 0.85
 
 
-# ===========================================================================
-# Environment Configuration
-# ===========================================================================
+def _extract_wall_segments_xy() -> list:
+    """Extract 2D wall segments from the USD Walls mesh for collision detection."""
+    try:
+        import omni.usd
+        from pxr import Gf, Usd, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        wall_root = stage.GetPrimAtPath("/World/Walls")
+        if not wall_root.IsValid():
+            return []
+
+        xf_cache = UsdGeom.XformCache()
+        segments: list = []
+
+        for prim in Usd.PrimRange(wall_root):
+            if not prim.IsA(UsdGeom.Mesh):
+                continue
+            mesh = UsdGeom.Mesh(prim)
+            points_attr = mesh.GetPointsAttr().Get()
+            if points_attr is None:
+                continue
+            counts_attr = mesh.GetFaceVertexCountsAttr().Get()
+            indices_attr = mesh.GetFaceVertexIndicesAttr().Get()
+            if counts_attr is None or indices_attr is None:
+                continue
+
+            world_xf = xf_cache.GetLocalToWorldTransform(prim)
+            world_pts = [
+                world_xf.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+                for p in points_attr
+            ]
+
+            idx_ptr = 0
+            for fc in counts_attr:
+                face = [int(indices_attr[idx_ptr + i]) for i in range(fc)]
+                idx_ptr += fc
+                for k in range(1, fc - 1):
+                    tri = (face[0], face[k], face[k + 1])
+                    pts3 = (world_pts[tri[0]], world_pts[tri[1]], world_pts[tri[2]])
+                    for e in range(3):
+                        a3 = pts3[e]
+                        b3 = pts3[(e + 1) % 3]
+                        if abs(a3[2] - b3[2]) > 0.05:
+                            continue
+                        dx = b3[0] - a3[0]
+                        dy = b3[1] - a3[1]
+                        if dx * dx + dy * dy < 1e-4:
+                            continue
+                        segments.append(
+                            [
+                                [float(a3[0]), float(a3[1])],
+                                [float(b3[0]), float(b3[1])],
+                            ]
+                        )
+        return segments
+    except Exception as e:
+        print(f"[ConeTrackEnv] Wall segment extraction failed: {e}")
+        return []
+
+
+# ── Config ─────────────────────────────────────────────────────────────────
 
 
 @configclass
@@ -75,6 +113,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         23  # Expanded from 8 to 23 to capture lookahead spatial points
     )
     state_space: int = 0
+    ui_window_class_type = None
 
     sim: SimulationCfg = SimulationCfg(dt=1.0 / 480.0, render_interval=8)
 
@@ -84,10 +123,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         replicate_physics=True,
     )
 
-    # ════════════════════════════════════════════════════════════════════════
-    # TRACK OBSERVATION — normalization and corner-detection parameters
-    # ════════════════════════════════════════════════════════════════════════
-    track_max_dist_m: float = 2.0  # normaliser for distance to centerline
+    # ── Track observation ──────────────────────────────────────────────────
+    track_max_dist_m: float = 0.4  # normaliser for distance to centerline
     corner_curvature_threshold: float = (
         0.5  # min curvature (1/m) to count as a corner peak
     )
@@ -96,10 +133,8 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     )
     max_curvature: float = 10.0  # normaliser for curvature (1/m)
 
-    # ════════════════════════════════════════════════════════════════════════
-    # SPAWN — initial robot position, heading, and speed
-    # ════════════════════════════════════════════════════════════════════════
-    spawn_grace_steps: int = 10
+    # ── Spawn ──────────────────────────────────────────────────────────────
+    spawn_grace_steps: int = 8
 
     preset_spawn_points: list = [
         (0.756, 5.0, 20.8),
@@ -114,9 +149,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     duplicate_with_flipped_yaw: bool = True
     spawn_yaw_jitter_rad: float = 0.1
 
-    # ════════════════════════════════════════════════════════════════════════
-    # DYNAMICS — effort-controlled DC-motor drivetrain (AWD), tuned to real car
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Dynamics ───────────────────────────────────────────────────────────
     car_mass_kg: float = 1.27
     max_velocity_m_s: float = 6.7
     drive_torque: float = 0.068
@@ -129,35 +162,25 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     suspension_stiffness: float = 1e6
     max_steer_rad: float = 0.488
 
-    # ════════════════════════════════════════════════════════════════════════
-    # TERMINATION THRESHOLDS
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Termination ────────────────────────────────────────────────────────
     wall_collision_radius_m: float = 0.15
-    slow_stop_speed_fraction: float = 0.03
+    slow_stop_speed_fraction: float = 0.04
 
-    # ════════════════════════════════════════════════════════════════════════
-    # REWARD WEIGHTS
-    # ════════════════════════════════════════════════════════════════════════
-    alive_weight: float = 0.015
+    # ── Rewards ────────────────────────────────────────────────────────────
+    alive_weight: float = 0.02
     distance_weight: float = 4.0
-    average_speed_weight: float = 0.0
     steer_deadzone_weight: float = 0.003
     steer_deadzone: float = 0.05
-    steer_rate_weight: float = 0.005
-    throttle_rate_weight: float = 0.007
-    slip_weight: float = 2.0
-    proximity_speed_weight: float = 0.0
-    proximity_lookahead_m: float = 2.0
-    braking_v2_weight: float = 0.0
+    steer_rate_weight: float = 0.003
+    throttle_rate_weight: float = 0.002
+    slip_weight: float = 0.03
 
-    lap_reward_weight: float = 8.0
+    roll_weight: float = 0.1
+
+    lap_reward_weight: float = 4.0
     lap_return_radius_m: float = 0.3
-    lap_min_time_s: float = 20.0
-    lap_max_time_s: float = 50.0
 
-    # ════════════════════════════════════════════════════════════════════════
-    # HARDWARE CONFIG  (robot articulation)
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Hardware (articulation) ────────────────────────────────────────────
     robot_cfg: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
@@ -225,9 +248,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
         )
 
 
-# ===========================================================================
-# Environment Class
-# ===========================================================================
+# ── Env ────────────────────────────────────────────────────────────────────
 
 
 class ConeTrackEnv(DirectRLEnv):
@@ -272,8 +293,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_curr = torch.zeros(self.num_envs, device=self.device)
         self._throttle_cmd_prev = torch.zeros(self.num_envs, device=self.device)
 
-        self._omega_noload_full = cfg.max_velocity_m_s / WHEEL_RADIUS
-
         self._lap_state = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -288,12 +307,9 @@ class ConeTrackEnv(DirectRLEnv):
             self.num_envs, dtype=torch.bool, device=self.device
         )
 
-        self._cumulative_forward_vel = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self.device
-        )
         self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
 
-        _wall_segs = self._extract_wall_segments_xy()
+        _wall_segs = _extract_wall_segments_xy()
         if _wall_segs:
             import numpy as _np
 
@@ -428,63 +444,19 @@ class ConeTrackEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    def _extract_wall_segments_xy(self):
-        try:
-            import omni.usd
-            from pxr import Gf, Usd, UsdGeom
-
-            stage = omni.usd.get_context().get_stage()
-            wall_root = stage.GetPrimAtPath("/World/Walls")
-            if not wall_root.IsValid():
-                return []
-
-            xf_cache = UsdGeom.XformCache()
-            segments: list = []
-
-            for prim in Usd.PrimRange(wall_root):
-                if not prim.IsA(UsdGeom.Mesh):
-                    continue
-                mesh = UsdGeom.Mesh(prim)
-                points_attr = mesh.GetPointsAttr().Get()
-                if points_attr is None:
-                    continue
-                counts_attr = mesh.GetFaceVertexCountsAttr().Get()
-                indices_attr = mesh.GetFaceVertexIndicesAttr().Get()
-                if counts_attr is None or indices_attr is None:
-                    continue
-
-                world_xf = xf_cache.GetLocalToWorldTransform(prim)
-                world_pts = [
-                    world_xf.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
-                    for p in points_attr
-                ]
-
-                idx_ptr = 0
-                for fc in counts_attr:
-                    face = [int(indices_attr[idx_ptr + i]) for i in range(fc)]
-                    idx_ptr += fc
-                    for k in range(1, fc - 1):
-                        tri = (face[0], face[k], face[k + 1])
-                        pts3 = (world_pts[tri[0]], world_pts[tri[1]], world_pts[tri[2]])
-                        for e in range(3):
-                            a3 = pts3[e]
-                            b3 = pts3[(e + 1) % 3]
-                            if abs(a3[2] - b3[2]) > 0.05:
-                                continue
-                            dx = b3[0] - a3[0]
-                            dy = b3[1] - a3[1]
-                            if dx * dx + dy * dy < 1e-4:
-                                continue
-                            segments.append(
-                                [
-                                    [float(a3[0]), float(a3[1])],
-                                    [float(b3[0]), float(b3[1])],
-                                ]
-                            )
-            return segments
-        except Exception as e:
-            print(f"[ConeTrackEnv] Wall segment extraction failed: {e}")
-            return []
+    def _compute_wall_hit(self) -> torch.Tensor:
+        if self._wall_seg_a is None:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        pos_xy = self.robot.data.root_pos_w[:, :2].unsqueeze(1)
+        a = self._wall_seg_a.unsqueeze(0)
+        b = self._wall_seg_b.unsqueeze(0)
+        ab = b - a
+        ap = pos_xy - a
+        t = (ap * ab).sum(dim=-1) / (ab * ab).sum(dim=-1).clamp(min=1e-8)
+        t = t.clamp(0.0, 1.0)
+        closest = a + t.unsqueeze(-1) * ab
+        dist_sq = (pos_xy - closest).pow(2).sum(dim=-1)
+        return dist_sq.min(dim=1).values.sqrt() < self.cfg.wall_collision_radius_m
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         raw = actions[:, :2].clamp(-1.0, 1.0)
@@ -520,23 +492,7 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_curr = raw[:, 0]
 
     def _apply_action(self) -> None:
-        if self._wall_seg_a is not None:
-            pos_xy = self.robot.data.root_pos_w[:, :2].unsqueeze(1)
-            a = self._wall_seg_a.unsqueeze(0)
-            b = self._wall_seg_b.unsqueeze(0)
-            ab = b - a
-            ap = pos_xy - a
-            t = (ap * ab).sum(dim=-1) / (ab * ab).sum(dim=-1).clamp(min=1e-8)
-            t = t.clamp(0.0, 1.0)
-            closest = a + t.unsqueeze(-1) * ab
-            dist_sq = (pos_xy - closest).pow(2).sum(dim=-1)
-            wall_hit_now = (
-                dist_sq.min(dim=1).values.sqrt() < self.cfg.wall_collision_radius_m
-            )
-        else:
-            wall_hit_now = torch.zeros(
-                self.num_envs, dtype=torch.bool, device=self.device
-            )
+        wall_hit_now = self._compute_wall_hit()
         in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
         self._wall_ever_touched |= wall_hit_now & ~in_grace
 
@@ -728,12 +684,6 @@ class ConeTrackEnv(DirectRLEnv):
                 lh_curv_norm = (lh_curv / cfg.max_curvature).clamp(0.0, 1.0)
 
                 lookahead_features.extend([local_x_norm, local_y_norm, lh_curv_norm])
-        else:
-            dist_cl_norm = torch.zeros(N, device=self.device)
-            rel_heading_norm = torch.zeros(N, device=self.device)
-            dist_corner_norm = torch.zeros(N, device=self.device)
-            corner_curv_norm = torch.zeros(N, device=self.device)
-            lookahead_features = [torch.zeros(N, device=self.device) for _ in range(15)]
 
         obs_list = [
             wheel_vel_norm,
@@ -758,14 +708,6 @@ class ConeTrackEnv(DirectRLEnv):
         )
 
         forward_speed = lin_vel_b.clamp(min=0.0)
-        self._cumulative_forward_vel += forward_speed
-        speed_sample_count = self.episode_length_buf.float().clamp(min=1.0)
-        avg_speed_norm = (
-            self._cumulative_forward_vel
-            / speed_sample_count
-            / self.cfg.max_velocity_m_s
-        ).clamp(0.0, 1.0)
-        r_average_speed = self.cfg.average_speed_weight * avg_speed_norm
 
         pos_xy = self.robot.data.root_pos_w[:, :2]
 
@@ -784,56 +726,19 @@ class ConeTrackEnv(DirectRLEnv):
             self.robot.data.joint_vel[:, self._all_throttle_ids].abs().mean(dim=-1)
         )
         wheel_vel = wheel_omega_mean * WHEEL_RADIUS
-        slip_ratio = (wheel_vel - forward_speed).abs() / self.cfg.max_velocity_m_s
+        slip_ratio = (wheel_vel - forward_speed).abs() / forward_speed.clamp(min=1e-3)
         r_slip = -self.cfg.slip_weight * slip_ratio.clamp(0.0, 1.0)
+
+        q = self.robot.data.root_quat_w
+        sin_roll = 2.0 * (q[:, 0] * q[:, 1] + q[:, 2] * q[:, 3])
+        cos_roll = 1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])
+        roll_deg = torch.rad2deg(torch.atan2(sin_roll, cos_roll))
+        roll_frac = roll_deg.abs() / 15.0
+        r_roll = -self.cfg.roll_weight * roll_frac
 
         r_alive = torch.full(
             (self.num_envs,), self.cfg.alive_weight, device=self.device
         )
-
-        if self.cfg.proximity_speed_weight > 0.0 and self._wall_seg_a is not None:
-            vel_w = self.robot.data.root_lin_vel_w[:, :2]
-            speed_w = torch.linalg.vector_norm(vel_w, dim=-1)
-            moving = speed_w > 0.5
-            dir_w = vel_w / speed_w.clamp(min=1e-3).unsqueeze(-1)
-
-            a = self._wall_seg_a.unsqueeze(0)
-            b = self._wall_seg_b.unsqueeze(0)
-            s = b - a
-            r = dir_w.unsqueeze(1)
-            ap = a - pos_xy.unsqueeze(1)
-
-            cross_rs = r[..., 0] * s[..., 1] - r[..., 1] * s[..., 0]
-            cross_ap_s = ap[..., 0] * s[..., 1] - ap[..., 1] * s[..., 0]
-            cross_ap_r = ap[..., 0] * r[..., 1] - ap[..., 1] * r[..., 0]
-
-            denom = torch.where(
-                cross_rs.abs() > 1e-8, cross_rs, torch.full_like(cross_rs, 1e-8)
-            )
-            t_hit = cross_ap_s / denom
-            u_hit = cross_ap_r / denom
-
-            hit = (
-                (cross_rs.abs() > 1e-8)
-                & (t_hit > 0.0)
-                & (u_hit >= 0.0)
-                & (u_hit <= 1.0)
-            )
-            t_masked = torch.where(hit, t_hit, torch.full_like(t_hit, float("inf")))
-            nearest_dist = t_masked.min(dim=1).values
-
-            closeness = 1.0 - (nearest_dist / self.cfg.proximity_lookahead_m).clamp(
-                0.0, 1.0
-            )
-            speed_norm = (speed_w / self.cfg.max_velocity_m_s).clamp(0.0, 1.0)
-            r_proximity_speed = (
-                -self.cfg.proximity_speed_weight
-                * closeness
-                * speed_norm
-                * moving.float()
-            )
-        else:
-            r_proximity_speed = torch.zeros(self.num_envs, device=self.device)
 
         pos_rel = pos_xy - self._spawn_pos
         forward_now = (
@@ -858,16 +763,13 @@ class ConeTrackEnv(DirectRLEnv):
 
         self._lap_prev_forward = forward_now.detach()
 
-        lap_steps_elapsed = (
+        lap_time_s = (
             (self.episode_length_buf - self._lap_start_step).float().clamp(min=1.0)
-        )
-        lap_time_s = lap_steps_elapsed * dt
-        lap_time_clamped = lap_time_s.clamp(
-            self.cfg.lap_min_time_s, self.cfg.lap_max_time_s
+            * dt
         )
         r_lap = torch.where(
             completing,
-            self.cfg.lap_reward_weight * self.cfg.lap_max_time_s / lap_time_clamped,
+            self.cfg.lap_reward_weight / lap_time_s,
             torch.zeros_like(lap_time_s),
         )
 
@@ -897,47 +799,20 @@ class ConeTrackEnv(DirectRLEnv):
             "Lap/laps_per_min": laps_per_min,
         }
 
-        if self.cfg.braking_v2_weight > 0.0:
-            throttle_cmd_v2 = self._throttle_cmd_curr
-            brake_input_v2 = (-throttle_cmd_v2).clamp(0.0, 1.0)
-            speed_fwd_v2 = lin_vel_b.clamp(min=0.0) / self.cfg.max_velocity_m_s
-            r_braking_v2 = (
-                self.cfg.braking_v2_weight * torch.pow(speed_fwd_v2, 2) * brake_input_v2
-            )
-        else:
-            r_braking_v2 = torch.zeros(self.num_envs, device=self.device)
-
         total = (
             r_alive
             + r_distance
-            + r_average_speed
             + r_steer_shape
             + r_steer_rate
             + r_throttle_rate
             + r_slip
-            + r_proximity_speed
-            + r_braking_v2
+            + r_roll
             + r_lap
         )
         return total
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._wall_seg_a is not None:
-            pos_xy = self.robot.data.root_pos_w[:, :2].unsqueeze(1)
-            a = self._wall_seg_a.unsqueeze(0)
-            b = self._wall_seg_b.unsqueeze(0)
-            ab = b - a
-            ap = pos_xy - a
-            t = (ap * ab).sum(dim=-1) / (ab * ab).sum(dim=-1).clamp(min=1e-8)
-            t = t.clamp(0.0, 1.0)
-            closest = a + t.unsqueeze(-1) * ab
-            dist_sq = (pos_xy - closest).pow(2).sum(dim=-1)
-            wall_hit = (
-                dist_sq.min(dim=1).values.sqrt() < self.cfg.wall_collision_radius_m
-            )
-        else:
-            wall_hit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
+        wall_hit = self._compute_wall_hit()
         in_grace = self.episode_length_buf < self.cfg.spawn_grace_steps
         self._wall_ever_touched |= wall_hit & ~in_grace
         wall_terminated = self._wall_ever_touched
@@ -1020,7 +895,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_prev[env_ids] = 0.0
 
         self._wall_ever_touched[env_ids] = False
-        self._cumulative_forward_vel[env_ids] = 0.0
         self._spawn_pos[env_ids_t] = spawn_xy
         self._lap_state[env_ids_t] = 0
         self._lap_start_step[env_ids_t] = 0
