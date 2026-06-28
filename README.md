@@ -66,12 +66,16 @@ excessive steering, rapid control changes, wheel slip, and body roll.
 ### Start training
 
 ```bash
-play --num_envs 200 --max_iterations 1000
+train --num_envs 200 --max_iterations 1000
 ```
 
-Data is logged to `logs/rsl_rl/cone_track/<timestamp>/`.
+Data is logged to `logs/rsl_rl/cone_track/<timestamp>/`. The
+`train.py` script automatically launches TensorBoard in the background
+and prints the URL (default port 6006, falls back to the next available
+port if taken). Open it in your browser to monitor live metrics.
 
-### Launch TensorBoard
+TensorBoard logs are at `logs/rsl_rl/cone_track/` — you can also
+launch manually:
 
 ```bash
 tensorboard --logdir logs/rsl_rl/cone_track
@@ -85,6 +89,7 @@ Key metrics to watch:
 | `Train/mean_episode_length` | How long agents survive (→ 10 800 = full episode) |
 | `Lap/lap_time_s` | Lap completion times (→ ~15–20 s is fast) |
 | `Lap/laps_per_min` | Combined lap rate across all envs |
+| `Lap/fastest_lap_s` | Global fastest lap so far |
 | `Train/mean_lr` | Adaptive learning rate (decreases with KL) |
 | `Info/kl` | Policy KL divergence (should stay near `desired_kl=0.01`) |
 
@@ -92,6 +97,57 @@ Key metrics to watch:
 
 ```bash
 play --checkpoint logs/rsl_rl/cone_track/<timestamp>/model_<iter>.pt
+```
+
+## Installation
+
+Requires **NVIDIA driver 550–580**, **uv** (Python package manager),
+and an **NVIDIA GPU** with at least 8 GB VRAM (tested on RTX 3070).
+
+```bash
+# 1. Install uv if you don't have it yet
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone the repo
+git clone git@github.com:MCiuzelis/LituanicaX_IsaacSimChallenge.git
+cd LituanicaX_IsaacSimChallenge
+
+# 3. Run the install script
+chmod +x install.sh
+./install.sh
+```
+
+`install.sh` does the following:
+
+1. **Driver check** — verifies the NVIDIA driver version is in the
+   compatible range (550–580). Exits early with a message if the
+   driver is ≥ 590 (known incompatibility with Isaac Sim 5.1).
+2. **Python 3.11** — installs via `uv python install 3.11` if not
+   already available.
+3. **Isaac Lab submodule** — syncs and initialises the `IsaacLab/`
+   submodule at the pinned tag `v2.3.0` (only version compatible
+   with Isaac Sim 5.1's dependency tree).
+4. **Virtual environment** — runs `uv venv --python 3.11` to create
+   `.venv/`, then `uv sync` to install all dependencies from the
+   lockfile.
+5. **Patches** — force-reinstalls `opencv-python` (GUI-capable build
+   replacing the headless variant pulled by Isaac Sim) and pins
+   `numpy<2.0.0` and `setuptools<82.0.0` for ABI and import
+   compatibility.
+6. **Helper scripts** — writes `train`, `play`, and `visualize`
+   wrappers to `~/.local/bin/` that `cd` to the project directory
+   and run `uv run python <name>.py "$@"`. On dual-GPU systems also
+   sets `__NV_PRIME_RENDER_OFFLOAD=1` to force Vulkan onto the
+   NVIDIA card.
+
+After the script finishes:
+
+```bash
+# Activate the venv (optional — the helper scripts handle this)
+source .venv/bin/activate
+
+# Verify it works
+train --help
 ```
 
 ## Spawn & direction balancing
@@ -128,7 +184,9 @@ directions improve, spawns converge back to 50/50.
 ├── cli_args.py           Shared CLI argument helpers
 ├── pyproject.toml        UV project config
 ├── uv.lock
-├── TrackPoints.csv       Centerline waypoints (Blender export)
+├── install.sh             One-shot setup script (see Installation)
+├── Track.blend            Track Blender source file
+├── TrackPoints.csv        Centerline waypoints (Blender export)
 ├── assets/
 │   ├── mushr_nano_v2.usd  MuSHR nano v2 robot
 │   ├── Track.usdc         Track mesh
@@ -141,5 +199,5 @@ directions improve, spawns converge back to 50/50.
 │           └── ppo_cfg.py  PPO runner & algorithm config
 ├── logs/rsl_rl/
 │   └── cone_track/         Training logs, checkpoints, videos
-└── .opencode/              Plan tracking
+└── .gitignore
 ```
