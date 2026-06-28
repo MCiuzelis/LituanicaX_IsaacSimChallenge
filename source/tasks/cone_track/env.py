@@ -167,7 +167,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     slow_stop_speed_fraction: float = 0.04
 
     # ── Rewards ────────────────────────────────────────────────────────────
-    alive_weight: float = 0.1  # used to be 0.02
+    alive_weight: float = 0.02
     distance_weight: float = 4.0
     steer_deadzone_weight: float = 0.003
     steer_deadzone: float = 0.05
@@ -176,9 +176,6 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     slip_weight: float = 0.03
 
     roll_weight: float = 0.1
-
-    lap_reward_weight: float = 4.0
-    lap_return_radius_m: float = 0.3
 
     # ── Hardware (articulation) ────────────────────────────────────────────
     robot_cfg: ArticulationCfg = ArticulationCfg(
@@ -293,16 +290,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_curr = torch.zeros(self.num_envs, device=self.device)
         self._throttle_cmd_prev = torch.zeros(self.num_envs, device=self.device)
 
-        self._lap_state = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self.device
-        )
-        self._lap_start_step = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self.device
-        )
-        self._fastest_lap_s_global = torch.tensor(0.0, device=self.device)
-        self._spawn_heading_cos = torch.ones(self.num_envs, device=self.device)
-        self._spawn_heading_sin = torch.zeros(self.num_envs, device=self.device)
-        self._lap_prev_forward = torch.zeros(self.num_envs, device=self.device)
         self._wall_ever_touched = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -313,8 +300,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._direction_ema_alpha = 0.005
         self._mean_ep_len_normal = torch.tensor(100.0, device=self.device)
         self._mean_ep_len_flipped = torch.tensor(100.0, device=self.device)
-
-        self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
 
         _wall_segs = _extract_wall_segments_xy()
         if _wall_segs:
@@ -724,8 +709,6 @@ class ConeTrackEnv(DirectRLEnv):
 
         forward_speed = lin_vel_b.clamp(min=0.0)
 
-        pos_xy = self.robot.data.root_pos_w[:, :2]
-
         steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0)
         steer_excess = (steer_norm - self.cfg.steer_deadzone).clamp(min=0.0)
         steer_excess_norm = steer_excess / max(1.0 - self.cfg.steer_deadzone, 1e-6)
@@ -755,64 +738,6 @@ class ConeTrackEnv(DirectRLEnv):
             (self.num_envs,), self.cfg.alive_weight, device=self.device
         )
 
-        pos_rel = pos_xy - self._spawn_pos
-        forward_now = (
-            pos_rel[:, 0] * self._spawn_heading_cos
-            + pos_rel[:, 1] * self._spawn_heading_sin
-        )
-        spawn_dist_for_lap = torch.linalg.vector_norm(pos_rel, dim=-1)
-        in_grace_lap = self.episode_length_buf < self.cfg.spawn_grace_steps
-
-        crossed_start_line = (self._lap_prev_forward * forward_now) < 0.0
-        in_return_radius = spawn_dist_for_lap < self.cfg.lap_return_radius_m
-
-        leaving = (self._lap_state == 0) & (~in_return_radius) & (~in_grace_lap)
-        self._lap_state = torch.where(
-            leaving, torch.ones_like(self._lap_state), self._lap_state
-        )
-
-        completing = (self._lap_state == 1) & crossed_start_line & in_return_radius
-        self._lap_state = torch.where(
-            completing, torch.zeros_like(self._lap_state), self._lap_state
-        )
-
-        self._lap_prev_forward = forward_now.detach()
-
-        lap_time_s = (self.episode_length_buf - self._lap_start_step).float().clamp(
-            min=1.0
-        ) * dt
-        r_lap = torch.where(
-            completing,
-            self.cfg.lap_reward_weight / lap_time_s,
-            torch.zeros_like(lap_time_s),
-        )
-
-        self._lap_start_step = torch.where(
-            completing, self.episode_length_buf.clone(), self._lap_start_step
-        )
-
-        empty = torch.tensor([], device=self.device)
-        if completing.any():
-            lap_times_done = lap_time_s[completing].detach()
-            new_min = lap_times_done.min()
-            self._fastest_lap_s_global = torch.where(
-                self._fastest_lap_s_global > 0,
-                torch.minimum(self._fastest_lap_s_global, new_min),
-                new_min,
-            )
-            fastest_log = self._fastest_lap_s_global.detach().unsqueeze(0).clone()
-        else:
-            lap_times_done = empty
-            fastest_log = empty
-
-        laps_per_min = completing.float().sum().unsqueeze(0) * (60.0 / dt)
-
-        self.extras["log"] = {
-            "Lap/lap_time_s": lap_times_done,
-            "Lap/fastest_lap_s": fastest_log,
-            "Lap/laps_per_min": laps_per_min,
-        }
-
         total = (
             r_alive
             + r_distance
@@ -821,7 +746,6 @@ class ConeTrackEnv(DirectRLEnv):
             + r_throttle_rate
             + r_slip
             + r_roll
-            + r_lap
         )
         return total
 
@@ -935,13 +859,6 @@ class ConeTrackEnv(DirectRLEnv):
         self._throttle_cmd_prev[env_ids] = 0.0
 
         self._wall_ever_touched[env_ids] = False
-        self._spawn_pos[env_ids_t] = spawn_xy
-        self._lap_state[env_ids_t] = 0
-        self._lap_start_step[env_ids_t] = 0
-        self._spawn_heading_cos[env_ids_t] = torch.cos(base_yaw)
-        self._spawn_heading_sin[env_ids_t] = torch.sin(base_yaw)
-        self._lap_prev_forward[env_ids_t] = 0.0
-
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
