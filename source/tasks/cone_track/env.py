@@ -27,7 +27,7 @@ _ASSETS_DIR = os.path.normpath(
 MUSHR_USD = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
 TRACK_USD = os.path.join(_ASSETS_DIR, "Track.usdc")
 _TRACKPOINTS_CSV = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "../../../../TrackPoints.csv")
+    os.path.join(os.path.dirname(__file__), "../../../TrackPoints.csv")
 )
 WALL_USD = os.path.join(_ASSETS_DIR, "Walls.usdc")
 
@@ -118,13 +118,13 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1.0 / 480.0, render_interval=8)
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=26,
+        num_envs=200,
         env_spacing=0.0,
         replicate_physics=True,
     )
 
     # ── Track observation ──────────────────────────────────────────────────
-    track_max_dist_m: float = 0.4  # normaliser for distance to centerline
+    track_max_dist_m: float = 0.3  # normaliser for distance to centerline
     corner_curvature_threshold: float = (
         0.5  # min curvature (1/m) to count as a corner peak
     )
@@ -167,7 +167,7 @@ class ConeTrackEnvCfg(DirectRLEnvCfg):
     slow_stop_speed_fraction: float = 0.04
 
     # ── Rewards ────────────────────────────────────────────────────────────
-    alive_weight: float = 0.02
+    alive_weight: float = 0.1  # used to be 0.02
     distance_weight: float = 4.0
     steer_deadzone_weight: float = 0.003
     steer_deadzone: float = 0.05
@@ -306,6 +306,13 @@ class ConeTrackEnv(DirectRLEnv):
         self._wall_ever_touched = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+
+        self._is_flipped_spawn = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._direction_ema_alpha = 0.005
+        self._mean_ep_len_normal = torch.tensor(100.0, device=self.device)
+        self._mean_ep_len_flipped = torch.tensor(100.0, device=self.device)
 
         self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
 
@@ -624,6 +631,10 @@ class ConeTrackEnv(DirectRLEnv):
             car_fwd = torch.stack([torch.cos(car_yaw), torch.sin(car_yaw)], dim=-1)
 
             tgt = tangents[nearest_idx]
+            vel_w = self.robot.data.root_lin_vel_w[:, :2]
+            fwd_dir = ((vel_w * tgt).sum(dim=-1) > 0.0).float()
+            idx_sign = (fwd_dir * 2 - 1).long()
+
             dot = (car_fwd * tgt).sum(dim=-1).clamp(-1.0, 1.0)
             heading_err = torch.acos(dot.abs())
 
@@ -637,8 +648,12 @@ class ConeTrackEnv(DirectRLEnv):
             arc_n = arc_at_nearest.unsqueeze(-1)
             arc_c = arc_corners.unsqueeze(0)
 
-            fwd_dist = torch.where(
+            fwd_dist_forward = torch.where(
                 arc_c >= arc_n, arc_c - arc_n, track_len - arc_n + arc_c
+            )
+            fwd_dir_mask = fwd_dir.unsqueeze(-1)
+            fwd_dist = torch.where(
+                fwd_dir_mask > 0.5, fwd_dist_forward, track_len - fwd_dist_forward
             )
             best_dist, best_k = fwd_dist.min(dim=1)
 
@@ -664,7 +679,7 @@ class ConeTrackEnv(DirectRLEnv):
             lookahead_features = []
 
             for offset in lookahead_offsets:
-                lh_idx = (nearest_idx + offset) % M
+                lh_idx = (nearest_idx + idx_sign * offset) % M
                 lh_pos = cl[lh_idx]  # [N, 2] world position of lookahead point
 
                 # Compute distance vector from vehicle to lookahead point
@@ -763,10 +778,9 @@ class ConeTrackEnv(DirectRLEnv):
 
         self._lap_prev_forward = forward_now.detach()
 
-        lap_time_s = (
-            (self.episode_length_buf - self._lap_start_step).float().clamp(min=1.0)
-            * dt
-        )
+        lap_time_s = (self.episode_length_buf - self._lap_start_step).float().clamp(
+            min=1.0
+        ) * dt
         r_lap = torch.where(
             completing,
             self.cfg.lap_reward_weight / lap_time_s,
@@ -834,6 +848,22 @@ class ConeTrackEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
 
+        ep_lens = self.episode_length_buf[env_ids].float()
+        flipped_mask = self._is_flipped_spawn[env_ids]
+        if len(env_ids) > 0:
+            len_normal = ep_lens[~flipped_mask]
+            len_flipped = ep_lens[flipped_mask]
+            if len_normal.numel() > 0:
+                self._mean_ep_len_normal = (
+                    (1.0 - self._direction_ema_alpha) * self._mean_ep_len_normal
+                    + self._direction_ema_alpha * len_normal.mean()
+                )
+            if len_flipped.numel() > 0:
+                self._mean_ep_len_flipped = (
+                    (1.0 - self._direction_ema_alpha) * self._mean_ep_len_flipped
+                    + self._direction_ema_alpha * len_flipped.mean()
+                )
+
         super()._reset_idx(env_ids)
 
         n = len(env_ids)
@@ -844,10 +874,20 @@ class ConeTrackEnv(DirectRLEnv):
         sz = 0.002
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
-        pts = list(self.cfg.preset_spawn_points)
-        if self.cfg.duplicate_with_flipped_yaw:
-            pts = pts + [(x, y, theta + 180.0) for x, y, theta in pts]
-        idx = torch.randint(0, len(pts), (n,), device="cpu").tolist()
+        pts_normal = list(self.cfg.preset_spawn_points)
+        pts_flipped = [(x, y, theta + 180.0) for x, y, theta in pts_normal]
+        n_normal = len(pts_normal)
+        eps = 1e-6
+        p_flipped = (
+            self._mean_ep_len_normal
+            / (self._mean_ep_len_normal + self._mean_ep_len_flipped + eps)
+        ).clamp(0.05, 0.95)
+        is_flipped = torch.rand(n, device=self.device) < p_flipped
+        self._is_flipped_spawn[env_ids_t] = is_flipped
+        idx_normal = torch.randint(0, n_normal, (n,), device="cpu")
+        idx_flipped = torch.randint(0, len(pts_flipped), (n,), device="cpu")
+        idx = torch.where(is_flipped.cpu(), idx_flipped + n_normal, idx_normal).tolist()
+        pts = pts_normal + pts_flipped
         xs = torch.tensor(
             [pts[i][0] * self.cfg.spawn_x_scale for i in idx],
             dtype=torch.float32,
