@@ -60,19 +60,37 @@ if ! uv python find 3.11 &>/dev/null; then
 fi
 
 # ─────────────────────────────────────────────────────────────
-# Isaac Lab submodule
+# Isaac Lab
 # ─────────────────────────────────────────────────────────────
+# Isaac Lab v2.3.0 is committed directly into this repo at IsaacLab/ — it is
+# not a submodule (it used to be one, under Training/).  Isaac Sim 5.1 resolves
+# cleanly against v2.3.0; newer Isaac Lab refs pull in a Starlette pin that
+# conflicts with Isaac Sim's FastAPI stack, so the ref is pinned by shipping
+# the tree.  pyproject.toml installs IsaacLab/source/* as editable path deps,
+# so a plain `git clone` is all that is needed.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 isaaclab_dir="${script_dir}/IsaacLab"
-isaaclab_ref="v2.3.0"
 
-git -C "${script_dir}" submodule sync --recursive
-git -C "${script_dir}" submodule update --init --recursive IsaacLab
+for pkg in isaaclab isaaclab_assets isaaclab_rl isaaclab_tasks; do
+    if [[ ! -d "${isaaclab_dir}/source/${pkg}" ]]; then
+        cat >&2 <<MISSING
 
-# Isaac Sim 5.1 resolves cleanly with Isaac Lab v2.3.0; newer Isaac Lab refs
-# pull in a Starlette pin that conflicts with Isaac Sim's FastAPI stack.
-git -C "${isaaclab_dir}" fetch --tags origin release/2.3.0 2>/dev/null || true
-git -C "${isaaclab_dir}" checkout --detach "${isaaclab_ref}"
+========================================================================
+ERROR: ${isaaclab_dir}/source/${pkg} is missing.
+
+Isaac Lab ships inside this repository, so a plain clone is enough:
+  git clone git@github.com:MCiuzelis/LituanicaX_IsaacSimChallenge.git
+
+If IsaacLab/ is missing or empty, the clone did not complete.  Re-clone
+into a new, empty directory — cloning on top of an existing directory
+fails with "already exists and is not an empty directory" and leaves a
+half-populated tree behind.
+========================================================================
+
+MISSING
+        exit 1
+    fi
+done
 
 # ─────────────────────────────────────────────────────────────
 # Python dependencies
