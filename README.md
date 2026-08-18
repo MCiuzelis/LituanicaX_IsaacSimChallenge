@@ -60,7 +60,7 @@ You need:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. Clone the repo
-git clone git@github.com:MCiuzelis/LituanicaX_IsaacSimChallenge.git
+git clone https://github.com/MCiuzelis/LituanicaX_IsaacSimChallenge.git
 cd LituanicaX_IsaacSimChallenge
 
 # 3. Run the install script
@@ -702,9 +702,10 @@ computes the fingerprint — so a team willing to edit `_locked.py` could send a
 twelve characters it liked. A lap re-driven on somebody else's computer cannot
 be edited into existence.
 
-A lap has to reproduce **within 0.1 s or 1% of the claim, whichever is larger**
-— tens of milliseconds of drift between two machines running the same policy is
-expected; a second is a different policy.
+A lap has to reproduce **within 0.001 s of the claim**, whatever the lap time.
+That is tighter than the drift between two machines running the same policy —
+tens of milliseconds is normal — so a lap is only expected to verify when the
+organisers re-run it on the hardware that set it.
 
 The fingerprint still decides whether a lap is *worth checking*: a lap that does
 not carry the official one is recorded and never queued. If your submission
