@@ -148,7 +148,7 @@ lituanicax_sdk/    LOCKED. The car, the ground, the physics, the lap clock —
 ├── vehicle.py       the car; dynamics.py the motor model
 ├── state.py         CarState — what your code reads
 ├── timing.py        the lap clock;  rules.py the crash rules
-├── track.py         tracks;  tracks/ the official one
+├── track.py         tracks;  tracks/ the official one, Blender source
 ├── spawn.py         where cars start; the default is (0, 0)
 ├── runs.py          where runs live, finding checkpoints
 ├── submit.py        publishing a lap, and the policy that set it
@@ -170,7 +170,6 @@ tests/             Runs on the CPU in seconds, without Isaac Sim.
 install.sh         One-shot setup script
 pyproject.toml     Dependencies and tool settings
 logs/              One folder per training run
-Track.blend        Blender source for the official track
 IsaacLab/          Isaac Lab, pinned to v2.3.0 — not our code
 ```
 

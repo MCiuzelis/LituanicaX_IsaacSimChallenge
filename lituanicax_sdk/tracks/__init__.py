@@ -35,9 +35,9 @@ _HERE = Path(__file__).resolve().parent
 
 OFFICIAL = TrackCfg(
     name="official",
-    surface_usd=str(_HERE / "official" / "Track.usdc"),
-    walls_usd=str(_HERE / "official" / "Walls.usdc"),
-    centerline_csv=str(_HERE / "official" / "centerline.csv"),
+    surface_usd=str(_HERE / "Track.usdc"),
+    walls_usd=str(_HERE / "Walls.usdc"),
+    centerline_csv=str(_HERE / "centerline.csv"),
     # The track mesh is modelled 1 / 0.85 too large.
     mesh_scale=0.85,
     # Blender to Isaac Sim. The centerline gets the same scale as the mesh it
